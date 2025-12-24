@@ -1,4 +1,7 @@
+// ---------- налаштування ----------
+
 const VS = "usd";
+// твій Node-проксі
 const BASE_URL = "http://localhost:4000/api";
 
 const statusEl = document.getElementById("status");
@@ -10,7 +13,9 @@ const daysInput = document.getElementById("days");
 const customIdInput = document.getElementById("customId");
 const addBtn = document.getElementById("addBtn");
 
-let currentRows = []; // тримаємо тут об’єкти монет для рендеру
+const LS_KEY = "btc_alt_custom_ids";
+let customIds = new Set(JSON.parse(localStorage.getItem(LS_KEY) || "[]"));
+let currentRows = []; // монети, які зараз у таблиці
 
 // ---------- утиліти ----------
 
@@ -21,6 +26,10 @@ async function fetchJson(url) {
     throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
   return res.json();
+}
+
+function saveCustomIds() {
+  localStorage.setItem(LS_KEY, JSON.stringify([...customIds]));
 }
 
 async function getTopCoins(limit = 11) {
@@ -63,6 +72,7 @@ function syncReturns(retA, retB, toleranceMs = 60_000) {
   return [outA, outB];
 }
 
+// ковзна кореляція Пірсона [web:135]
 function rollingCorrelation(arrA, arrB, window) {
   const n = Math.min(arrA.length, arrB.length);
   if (n < window) return null;
@@ -116,17 +126,18 @@ function renderTable() {
     tableBody.appendChild(tr);
   });
 
-  // навішуємо обробники на кнопки Видалити
   document.querySelectorAll(".remove-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.getAttribute("data-id");
       currentRows = currentRows.filter((r) => r.id !== id);
+      customIds.delete(id);
+      saveCustomIds();
       renderTable();
     });
   });
 }
 
-// ---------- логіка завантаження ----------
+// ---------- логіка обчислень ----------
 
 async function computeCorrForCoin(btcReturns, coin, windowSize, days) {
   const altHistory = await getHistory(coin.id, days);
@@ -142,7 +153,8 @@ async function computeCorrForCoin(btcReturns, coin, windowSize, days) {
   };
 }
 
-// завантажити топ‑10
+// ---------- завантаження топ‑10 ----------
+
 async function loadTopMenu() {
   errorEl.textContent = "";
   currentRows = [];
@@ -187,7 +199,47 @@ async function loadTopMenu() {
   }
 }
 
-// додати кастомну монету по id
+// ---------- збережені кастомні монети ----------
+
+async function loadSavedCustomCoins() {
+  if (!customIds.size) return;
+  const windowSize = Number(windowInput.value) || 30;
+  const days = Number(daysInput.value) || 1;
+
+  statusEl.textContent = "Завантажуємо збережені монети...";
+  try {
+    const btcHistory = await getHistory("bitcoin", days);
+    const btcReturns = toReturns(btcHistory);
+
+    for (const id of customIds) {
+      try {
+        const url = `${BASE_URL}/coins/markets?vs_currency=${VS}&ids=${encodeURIComponent(
+          id
+        )}&per_page=1&page=1&sparkline=false`;
+        const arr = await fetchJson(url);
+        if (!arr.length) continue;
+        const coin = arr[0];
+        const row = await computeCorrForCoin(
+          btcReturns,
+          coin,
+          windowSize,
+          days
+        );
+        const existingIdx = currentRows.findIndex((r) => r.id === row.id);
+        if (existingIdx >= 0) currentRows[existingIdx] = row;
+        else currentRows.push(row);
+        renderTable();
+      } catch (e) {
+        console.error("Error loading saved coin", id, e);
+      }
+    }
+  } finally {
+    statusEl.textContent = "";
+  }
+}
+
+// ---------- додавання нової монети з UI ----------
+
 async function addCustomCoin() {
   errorEl.textContent = "";
   const id = customIdInput.value.trim();
@@ -201,7 +253,6 @@ async function addCustomCoin() {
   statusEl.textContent = `Додаємо ${id}...`;
 
   try {
-    // інфо про монету (markets з per_page=1 через id) [web:130]
     const url = `${BASE_URL}/coins/markets?vs_currency=${VS}&ids=${encodeURIComponent(
       id
     )}&per_page=1&page=1&sparkline=false`;
@@ -211,18 +262,18 @@ async function addCustomCoin() {
     }
     const coin = arr[0];
 
-    // історія BTC (щоб не тягнути кожен раз – можна кешнути, але поки просто)
     const btcHistory = await getHistory("bitcoin", days);
     const btcReturns = toReturns(btcHistory);
 
     const row = await computeCorrForCoin(btcReturns, coin, windowSize, days);
 
-    // якщо така вже є в таблиці — заміняємо
     const existingIdx = currentRows.findIndex((r) => r.id === row.id);
     if (existingIdx >= 0) {
       currentRows[existingIdx] = row;
     } else {
       currentRows.push(row);
+      customIds.add(row.id);
+      saveCustomIds();
     }
     renderTable();
     statusEl.textContent = "Готово";
@@ -236,15 +287,15 @@ async function addCustomCoin() {
   }
 }
 
-// ---------- події ----------
+// ---------- події та старт ----------
 
 reloadBtn.addEventListener("click", () => {
-  loadTopMenu();
+  loadTopMenu().then(loadSavedCustomCoins);
 });
 
 addBtn.addEventListener("click", () => {
   addCustomCoin();
 });
 
-// автозапуск
-loadTopMenu();
+// перший запуск
+loadTopMenu().then(loadSavedCustomCoins);
