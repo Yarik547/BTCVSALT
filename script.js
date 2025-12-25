@@ -1,7 +1,6 @@
 // ---------- налаштування ----------
 
-const VS = "usd";
-// твій Node-проксі
+const VS = "USD"; // CryptoCompare чутливий до регістру
 const BASE_URL = "http://localhost:4000/api";
 
 const statusEl = document.getElementById("status");
@@ -13,9 +12,13 @@ const daysInput = document.getElementById("days");
 const customIdInput = document.getElementById("customId");
 const addBtn = document.getElementById("addBtn");
 
-const LS_KEY = "btc_alt_custom_ids";
+const LS_KEY = "btc_alt_custom_symbols";
 let customIds = new Set(JSON.parse(localStorage.getItem(LS_KEY) || "[]"));
-let currentRows = []; // монети, які зараз у таблиці
+let currentRows = [];
+
+function saveCustomIds() {
+  localStorage.setItem(LS_KEY, JSON.stringify([...customIds]));
+}
 
 // ---------- утиліти ----------
 
@@ -28,29 +31,55 @@ async function fetchJson(url) {
   return res.json();
 }
 
-function saveCustomIds() {
-  localStorage.setItem(LS_KEY, JSON.stringify([...customIds]));
-}
-
-async function getTopCoins(limit = 11) {
-  const url = `${BASE_URL}/coins/markets?vs_currency=${VS}&order=market_cap_desc&per_page=${limit}&page=1&sparkline=false`;
-  return fetchJson(url);
-}
-
-async function getHistory(coinId, days) {
-  const url = `${BASE_URL}/coins/${coinId}/market_chart?vs_currency=${VS}&days=${days}`;
+// топ монет за маркеткапом (BTC + інші)
+async function getTopCoins(limit = 10) {
+  const url = `${BASE_URL}/top-mktcap?tsym=${VS}&limit=${limit}`;
   const data = await fetchJson(url);
-  return data.prices;
+
+  if (data.Response === "Error") {
+    throw new Error(data.Message || "CryptoCompare error");
+  }
+
+  const raw = data.Data;
+  if (!Array.isArray(raw)) {
+    console.error("top-mktcap unexpected:", data);
+    throw new Error("Unexpected top-mktcap response format");
+  }
+
+  const list = raw
+    .map((d, idx) => {
+      const info = d.CoinInfo || {};
+      return {
+        symbol: info.Name, // BTC, ETH, ...
+        name: info.FullName || info.Name,
+        market_cap_rank: idx + 1,
+      };
+    })
+    .filter((c) => c.symbol);
+
+  return list;
 }
 
-function toReturns(priceArr) {
+// історія годинних свічок (close) [web:177]
+async function getHistory(symbol, days) {
+  const hours = Math.min(days * 24, 500); // запас по ліміту
+  const url = `${BASE_URL}/histohour?fsym=${symbol}&tsym=${VS}&limit=${hours}`;
+  const data = await fetchJson(url);
+  if (data.Response === "Error") {
+    throw new Error(data.Message || "histohour error");
+  }
+  return data.Data.Data || [];
+}
+
+// перетворення свічок у ретерни
+function toReturnsFromCandles(candles) {
   const returns = [];
-  for (let i = 1; i < priceArr.length; i++) {
-    const [tPrev, pPrev] = priceArr[i - 1];
-    const [t, p] = priceArr[i];
-    if (!pPrev) continue;
-    const r = (p - pPrev) / pPrev;
-    returns.push({ t, r });
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1].close;
+    const p = candles[i].close;
+    if (!prev) continue;
+    const r = (p - prev) / prev;
+    returns.push({ t: candles[i].time * 1000, r });
   }
   return returns;
 }
@@ -72,7 +101,7 @@ function syncReturns(retA, retB, toleranceMs = 60_000) {
   return [outA, outB];
 }
 
-// ковзна кореляція Пірсона [web:135]
+// ковзна кореляція Пірсона
 function rollingCorrelation(arrA, arrB, window) {
   const n = Math.min(arrA.length, arrB.length);
   if (n < window) return null;
@@ -118,39 +147,54 @@ function renderTable() {
     tr.innerHTML = `
       <td>${i + 1}</td>
       <td>${row.name}</td>
-      <td><span class="badge">${row.symbol.toUpperCase()}</span></td>
+      <td><span class="badge">${row.symbol}</span></td>
       <td>${row.market_cap_rank ?? "-"}</td>
       <td class="${corrClass}">${corrFormatted}</td>
-      <td><button data-id="${row.id}" class="remove-btn">Видалити</button></td>
+      <td><button data-id="${row.symbol}" class="remove-btn">Видалити</button></td>
     `;
     tableBody.appendChild(tr);
   });
 
   document.querySelectorAll(".remove-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-id");
-      currentRows = currentRows.filter((r) => r.id !== id);
-      customIds.delete(id);
+      const sym = btn.getAttribute("data-id");
+      currentRows = currentRows.filter((r) => r.symbol !== sym);
+      customIds.delete(sym);
       saveCustomIds();
       renderTable();
     });
   });
 }
 
-// ---------- логіка обчислень ----------
+// ---------- обчислення для монети ----------
 
-async function computeCorrForCoin(btcReturns, coin, windowSize, days) {
-  const altHistory = await getHistory(coin.id, days);
-  const altReturns = toReturns(altHistory);
+async function computeCorrForSymbol(
+  btcReturns,
+  symbol,
+  name,
+  rank,
+  windowSize,
+  days
+) {
+  const candles = await getHistory(symbol, days);
+  const altReturns = toReturnsFromCandles(candles);
   const [aSynced, bSynced] = syncReturns(btcReturns, altReturns);
   const corr = rollingCorrelation(aSynced, bSynced, windowSize);
   return {
-    id: coin.id,
-    symbol: coin.symbol,
-    name: coin.name,
-    market_cap_rank: coin.market_cap_rank,
+    symbol,
+    name,
+    market_cap_rank: rank,
     corr,
   };
+}
+
+// обмежуємо кількість днів (щоб не переломити ліміти)
+function getClampedDays() {
+  let days = Number(daysInput.value) || 1;
+  if (days < 1) days = 1;
+  const maxDays = 500 / 24; // для histohour з limit=500 [web:177]
+  if (days > maxDays) days = maxDays;
+  return days;
 }
 
 // ---------- завантаження топ‑10 ----------
@@ -161,30 +205,37 @@ async function loadTopMenu() {
   renderTable();
 
   const windowSize = Number(windowInput.value) || 30;
-  const days = Number(daysInput.value) || 1;
+  const days = getClampedDays();
 
   reloadBtn.disabled = true;
   addBtn.disabled = true;
   statusEl.textContent = "Завантаження топ‑монет...";
 
   try {
-    const top = await getTopCoins(11);
-    const btc = top.find((c) => c.id === "bitcoin");
+    const top = await getTopCoins(11); // BTC + 10 альтів
+    const btc = top.find((c) => c.symbol === "BTC");
     if (!btc) throw new Error("BTC не знайдено в топі");
-    const alts = top.filter((c) => c.id !== "bitcoin").slice(0, 10);
+    const alts = top.filter((c) => c.symbol !== "BTC").slice(0, 10);
 
     statusEl.textContent = "Завантаження історії BTC...";
-    const btcHistory = await getHistory("bitcoin", days);
-    const btcReturns = toReturns(btcHistory);
+    const btcCandles = await getHistory("BTC", days);
+    const btcReturns = toReturnsFromCandles(btcCandles);
 
     for (const coin of alts) {
       statusEl.textContent = `Рахуємо ${coin.name}...`;
       try {
-        const row = await computeCorrForCoin(btcReturns, coin, windowSize, days);
+        const row = await computeCorrForSymbol(
+          btcReturns,
+          coin.symbol,
+          coin.name,
+          coin.market_cap_rank,
+          windowSize,
+          days
+        );
         currentRows.push(row);
         renderTable();
       } catch (e) {
-        console.error("Error for coin", coin.id, e);
+        console.error("Error for coin", coin.symbol, e);
       }
     }
 
@@ -199,38 +250,62 @@ async function loadTopMenu() {
   }
 }
 
-// ---------- збережені кастомні монети ----------
+// ---------- підвантаження збережених монет ----------
 
 async function loadSavedCustomCoins() {
   if (!customIds.size) return;
+
   const windowSize = Number(windowInput.value) || 30;
-  const days = Number(daysInput.value) || 1;
+  const days = getClampedDays();
 
   statusEl.textContent = "Завантажуємо збережені монети...";
   try {
-    const btcHistory = await getHistory("bitcoin", days);
-    const btcReturns = toReturns(btcHistory);
+    const btcCandles = await getHistory("BTC", days);
+    const btcReturns = toReturnsFromCandles(btcCandles);
 
-    for (const id of customIds) {
+    for (const sym of customIds) {
       try {
-        const url = `${BASE_URL}/coins/markets?vs_currency=${VS}&ids=${encodeURIComponent(
-          id
-        )}&per_page=1&page=1&sparkline=false`;
-        const arr = await fetchJson(url);
-        if (!arr.length) continue;
-        const coin = arr[0];
-        const row = await computeCorrForCoin(
+        const url = `${BASE_URL}/top-mktcap?tsym=${VS}&limit=100`;
+        const data = await fetchJson(url);
+
+        if (data.Response === "Error") {
+          throw new Error(data.Message || "CryptoCompare error");
+        }
+        const raw = data.Data;
+        if (!Array.isArray(raw)) {
+          console.error("top-mktcap unexpected:", data);
+          throw new Error("Unexpected top-mktcap response format");
+        }
+        const list = raw
+          .map((d, idx) => {
+            const info = d.CoinInfo || {};
+            return {
+              symbol: info.Name,
+              name: info.FullName || info.Name,
+              market_cap_rank: idx + 1,
+            };
+          })
+          .filter((c) => c.symbol);
+
+        const coin = list.find((c) => c.symbol === sym);
+        if (!coin) continue;
+
+        const row = await computeCorrForSymbol(
           btcReturns,
-          coin,
+          coin.symbol,
+          coin.name,
+          coin.market_cap_rank,
           windowSize,
           days
         );
-        const existingIdx = currentRows.findIndex((r) => r.id === row.id);
+        const existingIdx = currentRows.findIndex(
+          (r) => r.symbol === row.symbol
+        );
         if (existingIdx >= 0) currentRows[existingIdx] = row;
         else currentRows.push(row);
         renderTable();
       } catch (e) {
-        console.error("Error loading saved coin", id, e);
+        console.error("Error loading saved coin", sym, e);
       }
     }
   } finally {
@@ -238,41 +313,68 @@ async function loadSavedCustomCoins() {
   }
 }
 
-// ---------- додавання нової монети з UI ----------
+// ---------- додавання монети з UI ----------
 
 async function addCustomCoin() {
   errorEl.textContent = "";
-  const id = customIdInput.value.trim();
-  if (!id) return;
+  const symRaw = customIdInput.value.trim();
+  if (!symRaw) return;
 
+  const symbol = symRaw.toUpperCase(); // символи великі
   const windowSize = Number(windowInput.value) || 30;
-  const days = Number(daysInput.value) || 1;
+  const days = getClampedDays();
 
   reloadBtn.disabled = true;
   addBtn.disabled = true;
-  statusEl.textContent = `Додаємо ${id}...`;
+  statusEl.textContent = `Додаємо ${symbol}...`;
 
   try {
-    const url = `${BASE_URL}/coins/markets?vs_currency=${VS}&ids=${encodeURIComponent(
-      id
-    )}&per_page=1&page=1&sparkline=false`;
-    const arr = await fetchJson(url);
-    if (!arr.length) {
-      throw new Error("Монету з таким id не знайдено");
+    const url = `${BASE_URL}/top-mktcap?tsym=${VS}&limit=100`;
+    const data = await fetchJson(url);
+
+    if (data.Response === "Error") {
+      throw new Error(data.Message || "CryptoCompare error");
     }
-    const coin = arr[0];
+    const raw = data.Data;
+    if (!Array.isArray(raw)) {
+      console.error("top-mktcap unexpected:", data);
+      throw new Error("Unexpected top-mktcap response format");
+    }
+    const list = raw
+      .map((d, idx) => {
+        const info = d.CoinInfo || {};
+        return {
+          symbol: info.Name,
+          name: info.FullName || info.Name,
+          market_cap_rank: idx + 1,
+        };
+      })
+      .filter((c) => c.symbol);
 
-    const btcHistory = await getHistory("bitcoin", days);
-    const btcReturns = toReturns(btcHistory);
+    const coin = list.find((c) => c.symbol === symbol);
+    if (!coin) {
+      throw new Error("Монету з таким символом не знайдено в топ‑списку");
+    }
 
-    const row = await computeCorrForCoin(btcReturns, coin, windowSize, days);
+    const btcCandles = await getHistory("BTC", days);
+    const btcReturns = toReturnsFromCandles(btcCandles);
 
-    const existingIdx = currentRows.findIndex((r) => r.id === row.id);
+    const row = await computeCorrForSymbol(
+      btcReturns,
+      coin.symbol,
+      coin.name,
+      coin.market_cap_rank,
+      windowSize,
+      days
+    );
+
+    const existingIdx =
+      currentRows.findIndex((r) => r.symbol === row.symbol);
     if (existingIdx >= 0) {
       currentRows[existingIdx] = row;
     } else {
       currentRows.push(row);
-      customIds.add(row.id);
+      customIds.add(row.symbol);
       saveCustomIds();
     }
     renderTable();
